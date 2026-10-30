@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -46,12 +48,20 @@ HALLUCINATIONS = {
 }
 
 SYSTEM_PROMPT = """\
-あなたは音声で会話するアシスタントです。
+これは音声での会話です。
 ユーザーの発話はマイクから文字起こししたもので、聞き間違いを含むことがあります。意味が通らないときは推測で進めず、短く聞き返してください。
 返答は音声合成で読み上げられます。日本語の話し言葉で、原則 2〜3 文で答えてください。
-箇条書き・表・見出し・コードブロック・URL・絵文字は使わないでください。
-使えるのはファイルの読み取り (Read / Grep / Glob) だけです。ファイルの変更やコマンドの実行を頼まれたら、この音声セッションではできないと伝えてください。
+箇条書き・表・見出し・コードブロック・URL・絵文字は使わないでください。CLAUDE.md などに書かれた出力形式の指示より、この音声向けの指示を優先してください。
+メッセージの送信、ファイルの書き込みや削除、外部サービスへの登録など、取り消しにくい操作や外部に出る操作の前は、何をどうするかを一文で読み上げ、ユーザーが「はい」と答えてから実行してください。聞き間違いのまま実行するのを防ぐためです。
+このセッションは確認画面を出せないため、承認が必要な操作は自動で拒否されます。拒否されたときは、その旨を短く伝えてください。
 """
+
+# NOTE: 長い返答を最後まで読み上げると会話にならないので、冒頭だけ読んで続きは画面に任せる
+MAX_SPEECH_CHARS = 300
+
+# NOTE: UserPromptSubmit フックにブロックされると、ブロック文が is_error: false の返答として返ってくる。
+#       文面はこの接頭辞で始まる（Claude Code 2.1.314 で実測）
+HOOK_BLOCKED_PREFIX = "UserPromptSubmit operation blocked by hook"
 
 
 def log(label: str, text: str = "") -> None:
@@ -121,7 +131,7 @@ class WakeMatcher:
     def __init__(self, words: list[str]):
         alternatives = "|".join(re.escape(unicodedata.normalize("NFKC", w)) for w in words)
         self.pattern = re.compile(
-            rf"^(?:ねえ|ねぇ|ヘイ|hey|おい)?[\s、,。.!！?？]*(?:{alternatives})(?:さん|くん)?[\s、,。.!！?？]*(.*)$",
+            rf"^(?:ねえ|ねぇ|ヘイ|hey|おい)?[\s、,。.!！?？・]*(?:{alternatives})(?:さん|くん)?[\s、,。.!！?？・]*(.*)$",
             re.IGNORECASE | re.DOTALL,
         )
 
@@ -132,7 +142,9 @@ class WakeMatcher:
 
 
 def to_speech(text: str) -> str:
-    """Markdown の記号など、読み上げに向かない部分を取り除く。"""
+    """Markdown の記号など、読み上げに向かない部分を取り除き、長ければ冒頭だけにする。"""
+    # [auto-review:done] のようなフック向けの印。[12:30] のような時刻や [text:x](url) のリンクは残す
+    text = re.sub(r"\[[A-Za-z][A-Za-z0-9_-]*:[A-Za-z][A-Za-z0-9_-]*\](?!\()", "", text)
     text = re.sub(r"```.*?```", "（コードは画面に出しています）", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
@@ -140,19 +152,37 @@ def to_speech(text: str) -> str:
     text = re.sub(r"^\s*\|.*\|\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*(?:#+|[-*+]|\d+\.)\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"[*_~>#]", "", text)
-    return re.sub(r"\n{2,}", "\n", text).strip()
+    text = "".join(c for c in text if unicodedata.category(c) != "So")  # 絵文字などの記号
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    if len(text) <= MAX_SPEECH_CHARS:
+        return text
+    head = text[:MAX_SPEECH_CHARS]
+    cut = max(head.rfind(c) for c in "。？！?!\n")
+    head = head[:cut + 1] if cut > 0 else head + "……。"
+    return head.rstrip() + "続きは画面に出しています。"
 
 
 class ClaudeSession:
     """claude -p を stream-json で常駐させ、1 プロセスで会話を続ける。
 
-    NOTE: 毎回 claude -p を起動すると 1 往復 5〜8 秒かかるが、常駐させると 2 回目以降は約 1 秒になる (実測)。
+    NOTE: 毎回 claude -p を起動すると 1 往復 5〜8 秒かかるが、常駐させると 2 回目以降は約 1 秒になる
+          (--safe-mode・sonnet での実測)。
     """
 
-    def __init__(self, workdir: Path, model: str | None, tools: str, timeout: float):
+    def __init__(
+        self,
+        workdir: Path,
+        model: str | None,
+        permission_mode: str,
+        tools: str | None,
+        safe_mode: bool,
+        timeout: float,
+    ):
         self.workdir = workdir
         self.model = model
+        self.permission_mode = permission_mode
         self.tools = tools
+        self.safe_mode = safe_mode
         self.timeout = timeout
         self.session_id: str | None = None
         self.proc: subprocess.Popen[str] | None = None
@@ -165,13 +195,15 @@ class ClaudeSession:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",
-            # NOTE: 個人設定 (CLAUDE.md・フック・MCP・Skill) を読み込まない。
-            #       UserPromptSubmit フックがプロンプトをブロックすると、そのブロック文が is_error: false の
-            #       返答として返ってきて読み上げられてしまう。CLAUDE.md や MCP の定義が毎回載るのも避けられる。
-            "--safe-mode",
-            "--tools", self.tools,
+            "--permission-mode", self.permission_mode,
             "--append-system-prompt", SYSTEM_PROMPT,
         ]
+        if self.safe_mode:
+            # 個人設定 (CLAUDE.md・フック・MCP・Skill) を読み込まない。軽く速いが、普段の Claude とは別物になる
+            cmd.append("--safe-mode")
+        if self.tools is not None:
+            # NOTE: 空文字は「すべての組み込みツールを無効にする」の意味なので、未指定 (None) と区別する
+            cmd += ["--tools", self.tools]
         if self.model:
             cmd += ["--model", self.model]
         if resume:
@@ -187,6 +219,11 @@ class ClaudeSession:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            # NOTE: フック側で音声セッションを見分けるための目印。
+            #       短いプロンプトを止める UserPromptSubmit フックなどは、これを見て素通しさせる
+            env={**os.environ, "CLAUDE_TALK": "1"},
+            # 打ち切るときに Bash ツールが起動した子プロセスごと止められるよう、プロセスグループを分ける
+            start_new_session=True,
         )
         # 再起動前のプロセスのイベントが混ざらないよう、キューはプロセスごとに作り直す
         self.events = queue.Queue()
@@ -207,7 +244,8 @@ class ClaudeSession:
             self.stderr_tail.append(line.rstrip())
 
     def ask(self, text: str) -> str:
-        # プロセスが落ちていたら同じ会話で再起動し、1 回だけ送り直す
+        # NOTE: 送る前にプロセスが落ちていたときだけ、同じ会話で再起動して送り直す。
+        #       送ったあとに落ちた場合は送り直さない（送信や書き込みが二重に実行されうるため）
         for _ in range(2):
             if self.proc is None or self.proc.poll() is not None:
                 self.start(resume=self.session_id)
@@ -220,12 +258,14 @@ class ClaudeSession:
                 continue
 
             reply = self._wait_result()
-            if reply is not None:
-                return reply
-            self.proc = None
-        raise RuntimeError("claude が終了しました: " + " / ".join(self.stderr_tail))
+            if reply is None:
+                self.proc = None
+                raise RuntimeError("claude が途中で終了しました: " + " / ".join(self.stderr_tail))
+            return reply
+        raise RuntimeError("claude を起動できませんでした: " + " / ".join(self.stderr_tail))
 
     def _wait_result(self) -> str | None:
+        # NOTE: 上限は最後のイベントからの経過時間。ツールを使う長い作業でも、動いている間は打ち切らない
         deadline = time.monotonic() + self.timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -238,6 +278,7 @@ class ClaudeSession:
                 continue
             if event is None:
                 return None
+            deadline = time.monotonic() + self.timeout
             if event.get("session_id"):
                 self.session_id = event["session_id"]
             if event.get("type") == "result":
@@ -256,7 +297,16 @@ class ClaudeSession:
             self.proc.stdin.close()
             self.proc.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
-            self.proc.kill()
+            # Bash ツールが起動した子プロセスも残さないよう、プロセスグループごと止める
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(self.proc.pid, sig)
+                    self.proc.wait(timeout=3)
+                    break
+                except ProcessLookupError:
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         self.proc = None
 
 
@@ -284,7 +334,14 @@ class VoiceAssistant:
     def __init__(self, args: argparse.Namespace):
         self.transcribe = Transcriber(args.whisper_model)
         self.wake = WakeMatcher(args.wake or DEFAULT_WAKE_WORDS)
-        self.claude = ClaudeSession(Path(args.workdir).expanduser(), args.model, args.tools, args.timeout)
+        self.claude = ClaudeSession(
+            workdir=Path(args.workdir).expanduser(),
+            model=args.model,
+            permission_mode=args.permission_mode,
+            tools=args.tools,
+            safe_mode=args.safe_mode,
+            timeout=args.timeout,
+        )
         self.speaker = Speaker(args.voice, args.rate, not args.no_speak)
         self.followup_sec = args.followup
         self.debug = args.debug
@@ -328,12 +385,15 @@ class VoiceAssistant:
         try:
             reply = self.claude.ask(command)
         except TimeoutError:
-            reply = "時間内に返事がありませんでした。"
+            reply = "時間内に返事がありませんでした。途中まで実行された可能性があるので、画面を確認してください。"
         except RuntimeError as e:
             log("エラー", str(e))
             reply = "エラーが起きました。画面を確認してください。"
         log("Claude", reply)
-        self.speaker.say(to_speech(reply))
+        if reply.lstrip().startswith(HOOK_BLOCKED_PREFIX):
+            self.speaker.say("フックに止められました。画面を確認してください。")
+        else:
+            self.speaker.say(to_speech(reply))
         self.followup_until = time.monotonic() + self.followup_sec
 
     def close(self) -> None:
@@ -394,16 +454,27 @@ def run_wav(assistant: VoiceAssistant, segmenter: Segmenter, path: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="マイクで話しかけると Claude が音声で答える")
-    p.add_argument("--workdir", default=str(Path.cwd()), help="Claude がファイルを読める起点のディレクトリ（既定: 起動したディレクトリ）")
-    p.add_argument("--model", default="sonnet", help="Claude のモデル。速さ優先で既定は sonnet（opus / haiku も可）")
-    p.add_argument("--tools", default="Read,Grep,Glob", help="音声セッションで使えるツール（既定: %(default)s）")
+    p.add_argument("--workdir", default=str(Path.cwd()), help="Claude Code を起動するディレクトリ（既定: 起動したディレクトリ）")
+    p.add_argument("--model", help="Claude のモデル（既定: Claude Code の設定どおり）。速さ優先なら sonnet")
+    p.add_argument(
+        "--permission-mode",
+        default="auto",
+        # NOTE: Claude Code 2.1.314 時点の選択肢。打ち間違いを起動時に弾くために列挙している
+        choices=["auto", "manual", "acceptEdits", "dontAsk", "plan", "bypassPermissions"],
+        help="権限モード（既定: %(default)s）。承認が必要な操作は確認画面を出せないため自動で拒否される。"
+        "bypassPermissions は聞き間違いがそのまま無確認で実行されるので勧めない",
+    )
+    p.add_argument("--tools", help="組み込みツールを絞る（例: Read,Grep,Glob）。MCP のツールは対象外。既定は絞らない")
+    p.add_argument("--safe-mode", action="store_true", help="CLAUDE.md・フック・MCP・Skill を読み込まない（軽く速い）")
     p.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL, help="文字起こしモデル（既定: %(default)s）")
     p.add_argument("--wake", action="append", help="呼びかけ語。複数指定可（既定: クロード / クロド / くろーど / claude）")
     p.add_argument("--followup", type=float, default=8.0, help="返答後、呼びかけなしで続けて話せる秒数。0 で無効（既定: %(default)s）")
     p.add_argument("--voice", default="Kyoko", help="say の声（既定: %(default)s）")
     p.add_argument("--rate", type=int, help="読み上げ速度（1 分あたりの語数）")
     p.add_argument("--vad-level", type=int, default=2, choices=range(4), help="発話検出の厳しさ 0〜3（既定: %(default)s）")
-    p.add_argument("--timeout", type=float, default=180.0, help="Claude の返答を待つ秒数（既定: %(default)s）")
+    p.add_argument(
+        "--timeout", type=float, default=600.0, help="最後の出力からこの秒数、何も返ってこなければ打ち切る（既定: %(default)s）"
+    )
     p.add_argument("--device", help="マイクのデバイス番号または名前")
     p.add_argument("--list-devices", action="store_true", help="オーディオデバイスの一覧を表示して終了")
     p.add_argument("--wav", help="マイクの代わりに WAV ファイルを流す（動作確認用）")
