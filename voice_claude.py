@@ -1,0 +1,439 @@
+"""マイクに話しかけると Claude が答え、その返答を読み上げる常駐プログラム。
+
+流れ:
+    マイク → 発話区間の検出 (webrtcvad) → ローカルで文字起こし (mlx-whisper)
+    → 呼びかけ語の判定 → claude -p (stream-json で常駐) → say で読み上げ
+
+音声はローカルで文字起こしし、Claude に送るのは呼びかけ語で始まる発話の文字だけ。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import wave
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import webrtcvad
+
+SAMPLE_RATE = 16000
+FRAME_MS = 30
+FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+FRAME_BYTES = FRAME_SAMPLES * 2  # int16 モノラル
+
+DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_WAKE_WORDS = ["クロード", "クロド", "くろーど", "claude"]
+RESET_PHRASES = ["新しい会話", "会話をリセット"]
+CUE_SOUND = Path("/System/Library/Sounds/Tink.aiff")
+
+# NOTE: Whisper が無音や雑音から生成しがちな定型文。呼びかけ後の受付時間中に拾っても送らない。
+HALLUCINATIONS = {
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございました。",
+    "おやすみなさい",
+    "おやすみなさい。",
+    "チャンネル登録お願いします",
+    "ありがとうございました。",
+}
+
+SYSTEM_PROMPT = """\
+あなたは音声で会話するアシスタントです。
+ユーザーの発話はマイクから文字起こししたもので、聞き間違いを含むことがあります。意味が通らないときは推測で進めず、短く聞き返してください。
+返答は音声合成で読み上げられます。日本語の話し言葉で、原則 2〜3 文で答えてください。
+箇条書き・表・見出し・コードブロック・URL・絵文字は使わないでください。
+使えるのはファイルの読み取り (Read / Grep / Glob) だけです。ファイルの変更やコマンドの実行を頼まれたら、この音声セッションではできないと伝えてください。
+"""
+
+
+def log(label: str, text: str = "") -> None:
+    print(f"[{datetime.now():%H:%M:%S}] {label}{': ' + text if text else ''}", flush=True)
+
+
+class Segmenter:
+    """30ms ごとのフレームを受け取り、発話のまとまり (PCM) を返す。"""
+
+    def __init__(self, vad_level: int, end_silence_ms: int = 800, max_ms: int = 30000, min_ms: int = 400):
+        self.vad = webrtcvad.Vad(vad_level)
+        self.start_ring: deque[tuple[bytes, bool]] = deque(maxlen=10)
+        self.end_ring: deque[bool] = deque(maxlen=end_silence_ms // FRAME_MS)
+        self.max_frames = max_ms // FRAME_MS
+        self.min_frames = min_ms // FRAME_MS
+        self.reset()
+
+    def reset(self) -> None:
+        self.triggered = False
+        self.voiced: list[bytes] = []
+        self.start_ring.clear()
+        self.end_ring.clear()
+
+    def push(self, frame: bytes) -> bytes | None:
+        is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+        if not self.triggered:
+            self.start_ring.append((frame, is_speech))
+            if sum(s for _, s in self.start_ring) >= 0.8 * self.start_ring.maxlen:
+                self.triggered = True
+                self.voiced = [f for f, _ in self.start_ring]
+                self.start_ring.clear()
+            return None
+
+        self.voiced.append(frame)
+        self.end_ring.append(is_speech)
+        silent = len(self.end_ring) == self.end_ring.maxlen and sum(self.end_ring) <= 0.1 * self.end_ring.maxlen
+        if not silent and len(self.voiced) < self.max_frames:
+            return None
+
+        frames = self.voiced
+        self.reset()
+        return b"".join(frames) if len(frames) >= self.min_frames else None
+
+
+class Transcriber:
+    def __init__(self, model: str):
+        import mlx_whisper
+
+        self._mlx_whisper = mlx_whisper
+        self.model = model
+
+    def __call__(self, pcm: bytes) -> str:
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        result = self._mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=self.model,
+            language="ja",
+            condition_on_previous_text=False,
+            verbose=None,
+        )
+        return result.get("text", "").strip()
+
+
+class WakeMatcher:
+    """「クロード、〜」のような呼びかけを判定し、呼びかけ語より後ろの文言を取り出す。"""
+
+    def __init__(self, words: list[str]):
+        alternatives = "|".join(re.escape(unicodedata.normalize("NFKC", w)) for w in words)
+        self.pattern = re.compile(
+            rf"^(?:ねえ|ねぇ|ヘイ|hey|おい)?[\s、,。.!！?？]*(?:{alternatives})(?:さん|くん)?[\s、,。.!！?？]*(.*)$",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+    def match(self, text: str) -> str | None:
+        """呼びかけでなければ None、呼びかけだけなら空文字を返す。"""
+        m = self.pattern.match(unicodedata.normalize("NFKC", text).strip())
+        return None if m is None else m.group(1).strip()
+
+
+def to_speech(text: str) -> str:
+    """Markdown の記号など、読み上げに向かない部分を取り除く。"""
+    text = re.sub(r"```.*?```", "（コードは画面に出しています）", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "リンク", text)
+    text = re.sub(r"^\s*\|.*\|\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*(?:#+|[-*+]|\d+\.)\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"[*_~>#]", "", text)
+    return re.sub(r"\n{2,}", "\n", text).strip()
+
+
+class ClaudeSession:
+    """claude -p を stream-json で常駐させ、1 プロセスで会話を続ける。
+
+    NOTE: 毎回 claude -p を起動すると 1 往復 5〜8 秒かかるが、常駐させると 2 回目以降は約 1 秒になる (実測)。
+    """
+
+    def __init__(self, workdir: Path, model: str | None, tools: str, timeout: float):
+        self.workdir = workdir
+        self.model = model
+        self.tools = tools
+        self.timeout = timeout
+        self.session_id: str | None = None
+        self.proc: subprocess.Popen[str] | None = None
+        self.events: queue.Queue[dict | None] = queue.Queue()
+        self.stderr_tail: deque[str] = deque(maxlen=20)
+
+    def _command(self, resume: str | None) -> list[str]:
+        cmd = [
+            "claude", "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            # NOTE: 個人設定 (CLAUDE.md・フック・MCP・Skill) を読み込まない。
+            #       UserPromptSubmit フックがプロンプトをブロックすると、そのブロック文が is_error: false の
+            #       返答として返ってきて読み上げられてしまう。CLAUDE.md や MCP の定義が毎回載るのも避けられる。
+            "--safe-mode",
+            "--tools", self.tools,
+            "--append-system-prompt", SYSTEM_PROMPT,
+        ]
+        if self.model:
+            cmd += ["--model", self.model]
+        if resume:
+            cmd += ["--resume", resume]
+        return cmd
+
+    def start(self, resume: str | None = None) -> None:
+        self.proc = subprocess.Popen(
+            self._command(resume),
+            cwd=self.workdir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        # 再起動前のプロセスのイベントが混ざらないよう、キューはプロセスごとに作り直す
+        self.events = queue.Queue()
+        threading.Thread(target=self._read_stdout, args=(self.proc, self.events), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(self.proc,), daemon=True).start()
+
+    @staticmethod
+    def _read_stdout(proc: subprocess.Popen[str], events: queue.Queue[dict | None]) -> None:
+        for line in proc.stdout:
+            try:
+                events.put(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        events.put(None)
+
+    def _read_stderr(self, proc: subprocess.Popen[str]) -> None:
+        for line in proc.stderr:
+            self.stderr_tail.append(line.rstrip())
+
+    def ask(self, text: str) -> str:
+        # プロセスが落ちていたら同じ会話で再起動し、1 回だけ送り直す
+        for _ in range(2):
+            if self.proc is None or self.proc.poll() is not None:
+                self.start(resume=self.session_id)
+            try:
+                message = {"type": "user", "message": {"role": "user", "content": text}}
+                self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+            except BrokenPipeError:
+                self.proc = None
+                continue
+
+            reply = self._wait_result()
+            if reply is not None:
+                return reply
+            self.proc = None
+        raise RuntimeError("claude が終了しました: " + " / ".join(self.stderr_tail))
+
+    def _wait_result(self) -> str | None:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.close()
+                raise TimeoutError
+            try:
+                event = self.events.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if event is None:
+                return None
+            if event.get("session_id"):
+                self.session_id = event["session_id"]
+            if event.get("type") == "result":
+                if event.get("is_error"):
+                    raise RuntimeError(str(event.get("result") or event.get("subtype")))
+                return event.get("result") or ""
+
+    def reset(self) -> None:
+        self.close()
+        self.session_id = None
+
+    def close(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+        self.proc = None
+
+
+class Speaker:
+    def __init__(self, voice: str, rate: int | None, enabled: bool):
+        self.voice = voice
+        self.rate = rate
+        self.enabled = enabled
+
+    def say(self, text: str) -> None:
+        if not self.enabled or not text:
+            return
+        cmd = ["say", "-v", self.voice, "-f", "-"]
+        if self.rate:
+            cmd += ["-r", str(self.rate)]
+        # 本文は標準入力で渡す (先頭が "-" の文がオプションとして解釈されないように)
+        subprocess.run(cmd, input=text, text=True, check=False)
+
+    def cue(self) -> None:
+        if self.enabled and CUE_SOUND.exists():
+            subprocess.Popen(["afplay", str(CUE_SOUND)])
+
+
+class VoiceAssistant:
+    def __init__(self, args: argparse.Namespace):
+        self.transcribe = Transcriber(args.whisper_model)
+        self.wake = WakeMatcher(args.wake or DEFAULT_WAKE_WORDS)
+        self.claude = ClaudeSession(Path(args.workdir).expanduser(), args.model, args.tools, args.timeout)
+        self.speaker = Speaker(args.voice, args.rate, not args.no_speak)
+        self.followup_sec = args.followup
+        self.debug = args.debug
+        self.followup_until = 0.0
+
+    def warm_up(self) -> None:
+        log("準備中", "文字起こしモデルを読み込んでいます（初回はダウンロードに数分かかります）")
+        self.transcribe(b"\0" * FRAME_BYTES * 20)
+        self.claude.start()
+
+    def handle(self, pcm: bytes) -> None:
+        if self.debug:
+            log("発話を検出", f"{len(pcm) / 2 / SAMPLE_RATE:.1f} 秒。文字起こし中")
+        text = self.transcribe(pcm)
+        if not text or text in HALLUCINATIONS:
+            if self.debug:
+                log("無視（文字起こし結果なし）", text)
+            return
+
+        command = self.wake.match(text)
+        if command is None:
+            if time.monotonic() > self.followup_until:
+                if self.debug:
+                    log("無視（呼びかけなし）", text)
+                return
+            command = text
+        log("あなた", text)
+
+        if command == "":
+            self.speaker.say("はい")
+            self.followup_until = time.monotonic() + self.followup_sec
+            return
+        if any(p in command for p in RESET_PHRASES):
+            self.claude.reset()
+            self.claude.start()
+            log("会話をリセットしました")
+            self.speaker.say("新しい会話を始めます")
+            return
+
+        self.speaker.cue()
+        try:
+            reply = self.claude.ask(command)
+        except TimeoutError:
+            reply = "時間内に返事がありませんでした。"
+        except RuntimeError as e:
+            log("エラー", str(e))
+            reply = "エラーが起きました。画面を確認してください。"
+        log("Claude", reply)
+        self.speaker.say(to_speech(reply))
+        self.followup_until = time.monotonic() + self.followup_sec
+
+    def close(self) -> None:
+        self.claude.close()
+
+
+def run_microphone(assistant: VoiceAssistant, segmenter: Segmenter, device: str | int | None) -> None:
+    import sounddevice as sd
+
+    frames: queue.Queue[bytes] = queue.Queue()
+
+    def callback(indata, _frames, _time, _status) -> None:
+        frames.put(bytes(indata))
+
+    buffer = bytearray()
+    peak = 0
+    meter_at = time.monotonic() + 3
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE, blocksize=FRAME_SAMPLES, dtype="int16", channels=1, device=device, callback=callback
+    ):
+        log("待機中", f"{sd.query_devices(device, 'input')['name']} で「クロード、〜」と話しかけてください（Ctrl+C で終了）")
+        while True:
+            buffer += frames.get()
+            while len(buffer) >= FRAME_BYTES:
+                frame = bytes(buffer[:FRAME_BYTES])
+                del buffer[:FRAME_BYTES]
+                if assistant.debug:
+                    # 3 秒ごとに入力の最大レベルを出す。話しても -40 dBFS 程度より上がらなければマイクに声が届いていない
+                    peak = max(peak, int(np.abs(np.frombuffer(frame, dtype=np.int16)).max()))
+                    if time.monotonic() >= meter_at:
+                        log("入力レベル", f"{20 * np.log10(max(peak, 1) / 32768):.0f} dBFS")
+                        peak = 0
+                        meter_at = time.monotonic() + 3
+                pcm = segmenter.push(frame)
+                if pcm is None:
+                    continue
+                assistant.handle(pcm)
+                # 考え中・読み上げ中に拾った音 (自分の読み上げ音声を含む) は捨てる
+                buffer.clear()
+                while not frames.empty():
+                    frames.get_nowait()
+                segmenter.reset()
+
+
+def run_wav(assistant: VoiceAssistant, segmenter: Segmenter, path: str) -> None:
+    """マイクの代わりに WAV ファイル (16kHz / モノラル / 16bit) を流す。動作確認用。"""
+    with wave.open(path, "rb") as w:
+        if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (SAMPLE_RATE, 1, 2):
+            sys.exit("WAV は 16kHz / モノラル / 16bit にしてください（afconvert -f WAVE -d LEI16@16000 -c 1 で変換できます）")
+        data = w.readframes(w.getnframes())
+    # 末尾に無音を足して、発話の終わりを確定させる
+    data += b"\0" * FRAME_BYTES * 40
+    for i in range(0, len(data) - FRAME_BYTES + 1, FRAME_BYTES):
+        pcm = segmenter.push(data[i:i + FRAME_BYTES])
+        if pcm is not None:
+            assistant.handle(pcm)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="マイクで話しかけると Claude が音声で答える")
+    p.add_argument("--workdir", default=str(Path.cwd()), help="Claude がファイルを読める起点のディレクトリ（既定: 起動したディレクトリ）")
+    p.add_argument("--model", default="sonnet", help="Claude のモデル。速さ優先で既定は sonnet（opus / haiku も可）")
+    p.add_argument("--tools", default="Read,Grep,Glob", help="音声セッションで使えるツール（既定: %(default)s）")
+    p.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL, help="文字起こしモデル（既定: %(default)s）")
+    p.add_argument("--wake", action="append", help="呼びかけ語。複数指定可（既定: クロード / クロド / くろーど / claude）")
+    p.add_argument("--followup", type=float, default=8.0, help="返答後、呼びかけなしで続けて話せる秒数。0 で無効（既定: %(default)s）")
+    p.add_argument("--voice", default="Kyoko", help="say の声（既定: %(default)s）")
+    p.add_argument("--rate", type=int, help="読み上げ速度（1 分あたりの語数）")
+    p.add_argument("--vad-level", type=int, default=2, choices=range(4), help="発話検出の厳しさ 0〜3（既定: %(default)s）")
+    p.add_argument("--timeout", type=float, default=180.0, help="Claude の返答を待つ秒数（既定: %(default)s）")
+    p.add_argument("--device", help="マイクのデバイス番号または名前")
+    p.add_argument("--list-devices", action="store_true", help="オーディオデバイスの一覧を表示して終了")
+    p.add_argument("--wav", help="マイクの代わりに WAV ファイルを流す（動作確認用）")
+    p.add_argument("--no-speak", action="store_true", help="読み上げずに画面表示だけにする")
+    p.add_argument("--debug", action="store_true", help="呼びかけなしで無視した発話も表示する")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.list_devices:
+        import sounddevice as sd
+
+        print(sd.query_devices())
+        return
+
+    device = int(args.device) if args.device and args.device.isdigit() else args.device
+    assistant = VoiceAssistant(args)
+    segmenter = Segmenter(args.vad_level)
+    try:
+        assistant.warm_up()
+        if args.wav:
+            run_wav(assistant, segmenter, args.wav)
+        else:
+            run_microphone(assistant, segmenter, device)
+    except KeyboardInterrupt:
+        log("終了します")
+    finally:
+        assistant.close()
+
+
+if __name__ == "__main__":
+    main()
