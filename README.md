@@ -1,4 +1,4 @@
-# voice-claude
+# claude-talk
 
 マイクに「クロード、〜」と話しかけると [Claude Code](https://code.claude.com/) が答え、その返答を音声で読み上げる macOS 用の常駐プログラムです。
 キー操作なしで、Claude と声で会話できます。
@@ -25,8 +25,8 @@
 ## セットアップ
 
 ```bash
-git clone https://github.com/<owner>/voice-claude.git
-cd voice-claude
+git clone https://github.com/Nash-BETA/claude-talk.git
+cd claude-talk
 uv sync
 ```
 
