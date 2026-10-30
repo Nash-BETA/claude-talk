@@ -65,7 +65,103 @@ HOOK_BLOCKED_PREFIX = "UserPromptSubmit operation blocked by hook"
 
 
 def log(label: str, text: str = "") -> None:
-    print(f"[{datetime.now():%H:%M:%S}] {label}{': ' + text if text else ''}", flush=True)
+    line = f"[{datetime.now():%H:%M:%S}] {label}{': ' + text if text else ''}"
+    # 最下行の状態表示をいったん消してからログを出し、その下に描き直す
+    with status.lock:
+        if status.enabled:
+            sys.stdout.write("\r\x1b[2K")
+        print(line, flush=True)
+    status.render(force=True)
+
+
+class StatusLine:
+    """ターミナルの最下行に今の状態を出し続ける。ログはその上に流す。
+
+    マイクの音量に合わせてバーが伸び縮みするので、声を拾えているかが話しながら分かる。
+    """
+
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    BAR_WIDTH = 12
+    # この範囲の入力レベル (dBFS) を、バーの空〜満タンに対応させる。
+    # 下限は室内の雑音（実測 -45〜-56 dBFS）でほとんど伸びない値にしている
+    LEVEL_FLOOR_DB = -50.0
+    LEVEL_CEIL_DB = -15.0
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.lock = threading.Lock()
+        self.state = "idle"
+        self.since = time.monotonic()
+        self.level = 0.0
+        self.followup_until = 0.0
+        self._rendered_at = 0.0
+
+    def start(self) -> None:
+        self.enabled = True
+        threading.Thread(target=self._tick, daemon=True).start()
+
+    def stop(self) -> None:
+        with self.lock:
+            if self.enabled:
+                self.enabled = False
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.flush()
+
+    def set(self, state: str) -> None:
+        if state == self.state:
+            return
+        self.state = state
+        self.since = time.monotonic()
+        self.render(force=True)
+
+    def update_level(self, frame: bytes) -> None:
+        if not self.enabled:
+            return
+        peak = int(np.abs(np.frombuffer(frame, dtype=np.int16).astype(np.int32)).max())
+        db = 20 * np.log10(max(peak, 1) / 32768)
+        level = (db - self.LEVEL_FLOOR_DB) / (self.LEVEL_CEIL_DB - self.LEVEL_FLOOR_DB)
+        # 上がるときはすぐ、下がるときはゆっくり（バーがちらつかないように）
+        self.level = max(min(max(level, 0.0), 1.0), self.level * 0.85)
+        self.render()
+
+    def text(self) -> str:
+        now = time.monotonic()
+        elapsed = now - self.since
+        spinner = self.SPINNER[int(now * 10) % len(self.SPINNER)]
+        filled = round(self.level * self.BAR_WIDTH)
+        bar = "█" * filled + "·" * (self.BAR_WIDTH - filled)
+        if self.state == "listening":
+            return f"👂 聞き取り中  {bar}  {elapsed:.1f} 秒"
+        if self.state == "transcribing":
+            return f"{spinner} 文字起こし中"
+        if self.state == "thinking":
+            return f"{spinner} 考え中  {elapsed:.0f} 秒"
+        if self.state == "speaking":
+            return "🔊 読み上げ中"
+        rest = self.followup_until - now
+        label = f"続けてどうぞ（あと {rest:.0f} 秒）" if rest > 0 else "待機中"
+        return f"🎙  {label}  {bar}"
+
+    def render(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._rendered_at < 0.1:
+            return
+        with self.lock:
+            if not self.enabled:
+                return
+            self._rendered_at = now
+            sys.stdout.write("\r\x1b[2K" + self.text())
+            sys.stdout.flush()
+
+    def _tick(self) -> None:
+        # 文字起こし中・考え中はメインの処理が止まるので、スピナーと経過秒数はここで進める
+        while self.enabled:
+            time.sleep(0.1)
+            if self.state != "listening":
+                self.render(force=True)
+
+
+status = StatusLine()
 
 
 class Segmenter:
@@ -353,6 +449,21 @@ class VoiceAssistant:
         self.claude.start()
 
     def handle(self, pcm: bytes) -> None:
+        status.set("transcribing")
+        try:
+            self._handle(pcm)
+        finally:
+            status.set("idle")
+
+    def _say(self, text: str) -> None:
+        status.set("speaking")
+        self.speaker.say(text)
+
+    def _open_followup(self) -> None:
+        self.followup_until = time.monotonic() + self.followup_sec
+        status.followup_until = self.followup_until
+
+    def _handle(self, pcm: bytes) -> None:
         if self.debug:
             log("発話を検出", f"{len(pcm) / 2 / SAMPLE_RATE:.1f} 秒。文字起こし中")
         text = self.transcribe(pcm)
@@ -371,17 +482,18 @@ class VoiceAssistant:
         log("あなた", text)
 
         if command == "":
-            self.speaker.say("はい")
-            self.followup_until = time.monotonic() + self.followup_sec
+            self._say("はい")
+            self._open_followup()
             return
         if any(p in command for p in RESET_PHRASES):
             self.claude.reset()
             self.claude.start()
             log("会話をリセットしました")
-            self.speaker.say("新しい会話を始めます")
+            self._say("新しい会話を始めます")
             return
 
         self.speaker.cue()
+        status.set("thinking")
         try:
             reply = self.claude.ask(command)
         except TimeoutError:
@@ -391,10 +503,10 @@ class VoiceAssistant:
             reply = "エラーが起きました。画面を確認してください。"
         log("Claude", reply)
         if reply.lstrip().startswith(HOOK_BLOCKED_PREFIX):
-            self.speaker.say("フックに止められました。画面を確認してください。")
+            self._say("フックに止められました。画面を確認してください。")
         else:
-            self.speaker.say(to_speech(reply))
-        self.followup_until = time.monotonic() + self.followup_sec
+            self._say(to_speech(reply))
+        self._open_followup()
 
     def close(self) -> None:
         self.claude.close()
@@ -427,8 +539,10 @@ def run_microphone(assistant: VoiceAssistant, segmenter: Segmenter, device: str 
                         log("入力レベル", f"{20 * np.log10(max(peak, 1) / 32768):.0f} dBFS")
                         peak = 0
                         meter_at = time.monotonic() + 3
+                status.update_level(frame)
                 pcm = segmenter.push(frame)
                 if pcm is None:
+                    status.set("listening" if segmenter.triggered else "idle")
                     continue
                 assistant.handle(pcm)
                 # 考え中・読み上げ中に拾った音 (自分の読み上げ音声を含む) は捨てる
@@ -499,10 +613,14 @@ def main() -> None:
         if args.wav:
             run_wav(assistant, segmenter, args.wav)
         else:
+            # ログをファイルやパイプに流すときは、状態表示の制御文字を混ぜない
+            if sys.stdout.isatty():
+                status.start()
             run_microphone(assistant, segmenter, device)
     except KeyboardInterrupt:
         log("終了します")
     finally:
+        status.stop()
         assistant.close()
 
 
