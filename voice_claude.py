@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,9 +24,12 @@ import unicodedata
 import wave
 from collections import deque
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
+import pykakasi
 import webrtcvad
 
 SAMPLE_RATE = 16000
@@ -33,8 +38,11 @@ FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 FRAME_BYTES = FRAME_SAMPLES * 2  # int16 モノラル
 
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-DEFAULT_WAKE_WORDS = ["クロード", "クロド", "くろーど", "claude"]
+# 「クロド」「グロード」「クロウド」のような聞き取りの揺れは、読みで比べて吸収する（reading() を参照）
+DEFAULT_WAKE_WORDS = ["クロード", "claude"]
 RESET_PHRASES = ["新しい会話", "会話をリセット"]
+# 呼びかけ語だけを言ったあと、続きを呼びかけなしで受け付ける秒数（返答後の --followup とは別）
+CALL_ONLY_WINDOW_SEC = 8.0
 CUE_SOUND = Path("/System/Library/Sounds/Tink.aiff")
 
 # NOTE: Whisper が無音や雑音から生成しがちな定型文。呼びかけ後の受付時間中に拾っても送らない。
@@ -64,20 +72,31 @@ MAX_SPEECH_CHARS = 300
 HOOK_BLOCKED_PREFIX = "UserPromptSubmit operation blocked by hook"
 
 
-def log(label: str, text: str = "") -> None:
-    line = f"[{datetime.now():%H:%M:%S}] {label}{': ' + text if text else ''}"
-    # 最下行の状態表示をいったん消してからログを出し、その下に描き直す
-    with status.lock:
-        if status.enabled:
-            sys.stdout.write("\r\x1b[2K")
-        print(line, flush=True)
-    status.render(force=True)
+def peak_dbfs(frame: bytes) -> float:
+    """フレームの最大振幅を dBFS で返す。"""
+    # NOTE: int16 のまま絶対値を取ると -32768 が桁あふれするので、int32 にしてから取る
+    peak = int(np.abs(np.frombuffer(frame, dtype=np.int16).astype(np.int32)).max())
+    return 20 * math.log10(max(peak, 1) / 32768)
+
+
+def display_width(ch: str) -> int:
+    # 端末の設定で幅が変わる文字（█ や絵文字など）は、折り返さないよう 2 桁として数える
+    return 1 if unicodedata.east_asian_width(ch) in ("Na", "H") else 2
+
+
+class State(StrEnum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    TRANSCRIBING = "transcribing"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
 
 
 class StatusLine:
     """ターミナルの最下行に今の状態を出し続ける。ログはその上に流す。
 
     マイクの音量に合わせてバーが伸び縮みするので、声を拾えているかが話しながら分かる。
+    定期的な描画は _tick スレッドだけが行う。音声を処理するメインループは端末への書き込みを待たない。
     """
 
     SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -90,11 +109,9 @@ class StatusLine:
     def __init__(self) -> None:
         self.enabled = False
         self.lock = threading.Lock()
-        self.state = "idle"
-        self.since = time.monotonic()
+        self.state_since: tuple[State, float] = (State.IDLE, time.monotonic())
         self.level = 0.0
         self.followup_until = 0.0
-        self._rendered_at = 0.0
 
     def start(self) -> None:
         self.enabled = True
@@ -107,69 +124,100 @@ class StatusLine:
                 sys.stdout.write("\r\x1b[2K")
                 sys.stdout.flush()
 
-    def set(self, state: str) -> None:
-        if state == self.state:
-            return
-        self.state = state
-        self.since = time.monotonic()
-        self.render(force=True)
+    def set_state(self, state: State) -> None:
+        # 状態と開始時刻は 1 つの組で差し替える（描画スレッドが新しい状態と古い経過秒数を組み合わせないように）
+        if state != self.state_since[0]:
+            self.state_since = (state, time.monotonic())
+
+    def open_followup(self, until: float) -> None:
+        self.followup_until = until
 
     def update_level(self, frame: bytes) -> None:
-        if not self.enabled:
-            return
-        peak = int(np.abs(np.frombuffer(frame, dtype=np.int16).astype(np.int32)).max())
-        db = 20 * np.log10(max(peak, 1) / 32768)
-        level = (db - self.LEVEL_FLOOR_DB) / (self.LEVEL_CEIL_DB - self.LEVEL_FLOOR_DB)
+        level = (peak_dbfs(frame) - self.LEVEL_FLOOR_DB) / (self.LEVEL_CEIL_DB - self.LEVEL_FLOOR_DB)
         # 上がるときはすぐ、下がるときはゆっくり（バーがちらつかないように）
         self.level = max(min(max(level, 0.0), 1.0), self.level * 0.85)
-        self.render()
 
     def text(self) -> str:
         now = time.monotonic()
-        elapsed = now - self.since
+        state, since = self.state_since
+        elapsed = now - since
         spinner = self.SPINNER[int(now * 10) % len(self.SPINNER)]
         filled = round(self.level * self.BAR_WIDTH)
         bar = "█" * filled + "·" * (self.BAR_WIDTH - filled)
-        if self.state == "listening":
-            return f"👂 聞き取り中  {bar}  {elapsed:.1f} 秒"
-        if self.state == "transcribing":
-            return f"{spinner} 文字起こし中"
-        if self.state == "thinking":
-            return f"{spinner} 考え中  {elapsed:.0f} 秒"
-        if self.state == "speaking":
-            return "🔊 読み上げ中"
-        rest = self.followup_until - now
-        label = f"続けてどうぞ（あと {rest:.0f} 秒）" if rest > 0 else "待機中"
-        return f"🎙  {label}  {bar}"
+        match state:
+            case State.LISTENING:
+                return f"👂 聞き取り中  {bar}  {elapsed:.1f} 秒"
+            case State.TRANSCRIBING:
+                return f"{spinner} 文字起こし中"
+            case State.THINKING:
+                return f"{spinner} 考え中  {elapsed:.0f} 秒"
+            case State.SPEAKING:
+                return "🔊 読み上げ中"
+            case State.IDLE:
+                rest = self.followup_until - now
+                label = f"続けてどうぞ（あと {math.ceil(rest)} 秒）" if rest > 0 else "待機中"
+                return f"🎙  {label}  {bar}"
+        raise ValueError(f"未知の状態: {state!r}")
 
-    def render(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self._rendered_at < 0.1:
-            return
+    def render(self) -> None:
         with self.lock:
             if not self.enabled:
                 return
-            self._rendered_at = now
-            sys.stdout.write("\r\x1b[2K" + self.text())
+            sys.stdout.write("\r\x1b[2K" + self._fit(self.text()))
             sys.stdout.flush()
 
+    @staticmethod
+    def _fit(text: str) -> str:
+        # 端末の幅を超えて折り返すと、\x1b[2K で消せない行が残って描画のたびに増えるので切り詰める
+        columns = shutil.get_terminal_size((80, 24)).columns - 1
+        width = 0
+        for i, ch in enumerate(text):
+            width += display_width(ch)
+            if width > columns:
+                return text[:i]
+        return text
+
     def _tick(self) -> None:
-        # 文字起こし中・考え中はメインの処理が止まるので、スピナーと経過秒数はここで進める
         while self.enabled:
             time.sleep(0.1)
-            if self.state != "listening":
-                self.render(force=True)
+            self.render()
 
 
-status = StatusLine()
+status_line = StatusLine()
+
+
+def log(label: str, text: str = "") -> None:
+    line = f"[{datetime.now():%H:%M:%S}] {label}{': ' + text if text else ''}"
+    # 最下行の状態表示をいったん消してからログを出し、その下に描き直す
+    with status_line.lock:
+        if status_line.enabled:
+            sys.stdout.write("\r\x1b[2K")
+        print(line, flush=True)
+    status_line.render()
+
+
+class Utterance(NamedTuple):
+    pcm: bytes
+    started_at: float  # 話し始めと判定した時刻 (time.monotonic())
 
 
 class Segmenter:
-    """30ms ごとのフレームを受け取り、発話のまとまり (PCM) を返す。"""
+    """30ms ごとのフレームを受け取り、発話のまとまりを返す。"""
 
-    def __init__(self, vad_level: int, end_silence_ms: int = 800, max_ms: int = 30000, min_ms: int = 400):
+    def __init__(
+        self,
+        vad_level: int,
+        end_silence_ms: int = 1200,
+        preroll_ms: int = 600,
+        max_ms: int = 30000,
+        min_ms: int = 400,
+    ):
         self.vad = webrtcvad.Vad(vad_level)
-        self.start_ring: deque[tuple[bytes, bool]] = deque(maxlen=10)
+        # 話し始めの判定に使う、直近 300ms の「声かどうか」
+        self.start_ring: deque[bool] = deque(maxlen=10)
+        # NOTE: 話し始めと判定する頃には、頭の子音（「ク」のような息だけの音）が過ぎていることがある。
+        #       判定より前の音も取り込んで、「ロード」のように頭が欠けるのを防ぐ
+        self.preroll: deque[bytes] = deque(maxlen=preroll_ms // FRAME_MS)
         self.end_ring: deque[bool] = deque(maxlen=end_silence_ms // FRAME_MS)
         self.max_frames = max_ms // FRAME_MS
         self.min_frames = min_ms // FRAME_MS
@@ -177,18 +225,23 @@ class Segmenter:
 
     def reset(self) -> None:
         self.triggered = False
+        self.started_at = 0.0
         self.voiced: list[bytes] = []
         self.start_ring.clear()
+        self.preroll.clear()
         self.end_ring.clear()
 
-    def push(self, frame: bytes) -> bytes | None:
+    def push(self, frame: bytes) -> Utterance | None:
         is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
         if not self.triggered:
-            self.start_ring.append((frame, is_speech))
-            if sum(s for _, s in self.start_ring) >= 0.8 * self.start_ring.maxlen:
+            self.preroll.append(frame)
+            self.start_ring.append(is_speech)
+            if sum(self.start_ring) >= 0.8 * self.start_ring.maxlen:
                 self.triggered = True
-                self.voiced = [f for f, _ in self.start_ring]
+                self.started_at = time.monotonic()
+                self.voiced = list(self.preroll)
                 self.start_ring.clear()
+                self.preroll.clear()
             return None
 
         self.voiced.append(frame)
@@ -197,9 +250,11 @@ class Segmenter:
         if not silent and len(self.voiced) < self.max_frames:
             return None
 
-        frames = self.voiced
+        frames, started_at = self.voiced, self.started_at
         self.reset()
-        return b"".join(frames) if len(frames) >= self.min_frames else None
+        if len(frames) < self.min_frames:
+            return None
+        return Utterance(b"".join(frames), started_at)
 
 
 class Transcriber:
@@ -221,20 +276,73 @@ class Transcriber:
         return result.get("text", "").strip()
 
 
+_kakasi = pykakasi.kakasi()
+_O_ROW = set("オコソトノホモヨロゴゾドボポョォ")
+_SMALL_KANA = str.maketrans("ァィゥェォャュョッヮ", "アイウエオヤユヨツワ")
+_SEP = r"\s、,。.!！?？・"
+
+
+def reading(text: str) -> str:
+    """読みをカタカナにそろえ、聞き取りで揺れやすい部分を落とす。
+
+    「クロード」「クロド」「グロード」「クロウド」はどれも「クロト」になる。
+    「クラウド」（クラウト）や「クロス」は別の読みのまま残る。
+    """
+    kana = "".join(item["kana"] for item in _kakasi.convert(unicodedata.normalize("NFKC", text)))
+    out: list[str] = []
+    for ch in kana.lower():
+        if ch in "ー〜～":  # 長音
+            continue
+        if ch in "ウオ" and out and out[-1] in _O_ROW:  # ロウ・ロオ → ロ
+            continue
+        out.append(ch)
+    s = "".join(out).translate(_SMALL_KANA)
+    # 濁点・半濁点を外す（グ → ク、ド → ト）
+    return "".join(c for c in unicodedata.normalize("NFD", s) if c not in "゙゚")
+
+
 class WakeMatcher:
-    """「クロード、〜」のような呼びかけを判定し、呼びかけ語より後ろの文言を取り出す。"""
+    """「クロード、〜」のような呼びかけを判定し、呼びかけ語より後ろの文言を取り出す。
+
+    呼びかけ語は読みで比べるので、「クロド」「グロード」「クロウド」のような聞き取りの揺れも拾う。
+    """
+
+    MAX_PREFIX = 4  # 呼びかけ語の前に置ける一言の長さ（「えっと」「あのー」など）
+    PREFIX_SEARCH = MAX_PREFIX + 3  # 一言のあとに続く区切り（「、」や空白）のぶんを足した、呼びかけ語の開始位置の上限
+    MAX_WORD = 8  # 呼びかけ語として調べる文字数の最小の上限（「Claude」の 6 文字が入る長さ）
+    # NOTE: 漢字を含む並びは呼びかけ語として扱わない。「黒と白」「苦労とは」「玄人好み」も読みはクロトになるが、
+    #       呼びかけではない。名前は文字起こしでカタカナか英字になるので、取りこぼしはほぼ無い
+    KANJI = re.compile(r"[一-鿿々〆]")
+    # 決まった前置き付きの呼びかけ（「ねえクロード」）は、これまでどおり直後に区切りが無くても受け付ける
+    CALLER = re.compile(rf"^(?:ねえ|ねぇ|ヘイ|hey|おい)?[{_SEP}]*$", re.IGNORECASE)
+    # NOTE: それ以外の前置き（ひらがなの一言）は、呼びかけ語の直後が区切りか「さん」「くん」のときだけ受け付ける。
+    #       「さっきクロードに聞いたら」のように、会話の中で名前が出ただけの発話を拾わないため
+    FILLER = re.compile(rf"^[ぁ-んー]{{1,{MAX_PREFIX}}}[{_SEP}]*$")
+    AFTER_CALL = re.compile(rf"^(?:$|[{_SEP}]|さん|くん)")
+    HONORIFIC = re.compile(rf"^(?:さん|くん)?[{_SEP}]*")
 
     def __init__(self, words: list[str]):
-        alternatives = "|".join(re.escape(unicodedata.normalize("NFKC", w)) for w in words)
-        self.pattern = re.compile(
-            rf"^(?:ねえ|ねぇ|ヘイ|hey|おい)?[\s、,。.!！?？・]*(?:{alternatives})(?:さん|くん)?[\s、,。.!！?？・]*(.*)$",
-            re.IGNORECASE | re.DOTALL,
-        )
+        self.targets = {reading(w) for w in words}
+        # 長い呼びかけ語（--wake で指定したもの）も調べられるよう、表記の揺れで伸びるぶん（+2）を足す
+        self.max_word = max(self.MAX_WORD, max(len(w) for w in words) + 2)
 
     def match(self, text: str) -> str | None:
         """呼びかけでなければ None、呼びかけだけなら空文字を返す。"""
-        m = self.pattern.match(unicodedata.normalize("NFKC", text).strip())
-        return None if m is None else m.group(1).strip()
+        text = unicodedata.normalize("NFKC", text).strip()
+        for i in range(min(len(text), self.PREFIX_SEARCH)):
+            by_caller = bool(self.CALLER.match(text[:i]))
+            if not by_caller and not self.FILLER.match(text[:i]):
+                continue
+            for j in range(i + 1, min(len(text), i + self.max_word) + 1):
+                segment = text[i:j]
+                if self.KANJI.search(segment):
+                    break  # これより長い並びも漢字を含む
+                if reading(segment) not in self.targets:
+                    continue
+                rest = text[j:]
+                if by_caller or self.AFTER_CALL.match(rest):
+                    return self.HONORIFIC.sub("", rest, count=1).strip()
+        return None
 
 
 def to_speech(text: str) -> str:
@@ -441,6 +549,8 @@ class VoiceAssistant:
         self.speaker = Speaker(args.voice, args.rate, not args.no_speak)
         self.followup_sec = args.followup
         self.debug = args.debug
+        # 呼びかけなしで受け付ける発話の、話し始めの時刻の範囲
+        self.followup_from = 0.0
         self.followup_until = 0.0
 
     def warm_up(self) -> None:
@@ -448,52 +558,66 @@ class VoiceAssistant:
         self.transcribe(b"\0" * FRAME_BYTES * 20)
         self.claude.start()
 
-    def handle(self, pcm: bytes) -> None:
-        status.set("transcribing")
+    def handle(self, pcm: bytes, started_at: float) -> bool:
+        """発話を 1 つ処理する。読み上げや効果音を出したときは True を返す。"""
+        heard_at = time.monotonic()
+        status_line.set_state(State.TRANSCRIBING)
         try:
-            self._handle(pcm)
+            return self._handle(pcm, started_at, heard_at)
         finally:
-            status.set("idle")
+            status_line.set_state(State.IDLE)
 
     def _say(self, text: str) -> None:
-        status.set("speaking")
+        status_line.set_state(State.SPEAKING)
         self.speaker.say(text)
 
-    def _open_followup(self) -> None:
-        self.followup_until = time.monotonic() + self.followup_sec
-        status.followup_until = self.followup_until
+    def _open_followup(self, since: float, seconds: float) -> None:
+        self.followup_from = since
+        self.followup_until = time.monotonic() + seconds
+        status_line.open_followup(self.followup_until)
 
-    def _handle(self, pcm: bytes) -> None:
+    def _in_followup(self, started_at: float) -> bool:
+        # NOTE: 文字起こしが終わった時刻ではなく、話し始めた時刻で判定する。
+        #       画面の「あと N 秒」のうちに話し始めた発話を、話し終わるのが遅れたせいで取りこぼさないように。
+        #       started_at はフレームを「処理した」時刻。マイクから「取得した」時刻に変えるときは、
+        #       followup_from も同じ基準にそろえること（そろえないと、下限で正しい続きを落とす）
+        return self.followup_from <= started_at <= self.followup_until
+
+    def _handle(self, pcm: bytes, started_at: float, heard_at: float) -> bool:
         if self.debug:
             log("発話を検出", f"{len(pcm) / 2 / SAMPLE_RATE:.1f} 秒。文字起こし中")
         text = self.transcribe(pcm)
         if not text or text in HALLUCINATIONS:
             if self.debug:
                 log("無視（文字起こし結果なし）", text)
-            return
+            return False
 
         command = self.wake.match(text)
         if command is None:
-            if time.monotonic() > self.followup_until:
+            if not self._in_followup(started_at):
                 if self.debug:
                     log("無視（呼びかけなし）", text)
-                return
+                return False
             command = text
         log("あなた", text)
 
         if command == "":
-            self._say("はい")
-            self._open_followup()
-            return
+            # NOTE: 呼びかけ語だけのときは返事をしない。「クロード、」のあとの間で発話が区切られても、
+            #       続きを話している最中に声を重ねず、その間に拾った音も捨てずに聞き続けるため。
+            #       受け付けていることは最下行の「続けてどうぞ」で示す
+            self._open_followup(since=heard_at, seconds=CALL_ONLY_WINDOW_SEC)
+            if not status_line.enabled:
+                log("受付中", f"{CALL_ONLY_WINDOW_SEC:.0f} 秒以内に続けて話してください")
+            return False
         if any(p in command for p in RESET_PHRASES):
             self.claude.reset()
             self.claude.start()
             log("会話をリセットしました")
             self._say("新しい会話を始めます")
-            return
+            return True
 
         self.speaker.cue()
-        status.set("thinking")
+        status_line.set_state(State.THINKING)
         try:
             reply = self.claude.ask(command)
         except TimeoutError:
@@ -506,7 +630,8 @@ class VoiceAssistant:
             self._say("フックに止められました。画面を確認してください。")
         else:
             self._say(to_speech(reply))
-        self._open_followup()
+        self._open_followup(since=time.monotonic(), seconds=self.followup_sec)
+        return True
 
     def close(self) -> None:
         self.claude.close()
@@ -521,7 +646,7 @@ def run_microphone(assistant: VoiceAssistant, segmenter: Segmenter, device: str 
         frames.put(bytes(indata))
 
     buffer = bytearray()
-    peak = 0
+    peak_db = -math.inf
     meter_at = time.monotonic() + 3
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE, blocksize=FRAME_SAMPLES, dtype="int16", channels=1, device=device, callback=callback
@@ -534,17 +659,19 @@ def run_microphone(assistant: VoiceAssistant, segmenter: Segmenter, device: str 
                 del buffer[:FRAME_BYTES]
                 if assistant.debug:
                     # 3 秒ごとに入力の最大レベルを出す。話しても -40 dBFS 程度より上がらなければマイクに声が届いていない
-                    peak = max(peak, int(np.abs(np.frombuffer(frame, dtype=np.int16)).max()))
+                    peak_db = max(peak_db, peak_dbfs(frame))
                     if time.monotonic() >= meter_at:
-                        log("入力レベル", f"{20 * np.log10(max(peak, 1) / 32768):.0f} dBFS")
-                        peak = 0
+                        log("入力レベル", f"{peak_db:.0f} dBFS")
+                        peak_db = -math.inf
                         meter_at = time.monotonic() + 3
-                status.update_level(frame)
-                pcm = segmenter.push(frame)
-                if pcm is None:
-                    status.set("listening" if segmenter.triggered else "idle")
+                status_line.update_level(frame)
+                utterance = segmenter.push(frame)
+                if utterance is None:
+                    status_line.set_state(State.LISTENING if segmenter.triggered else State.IDLE)
                     continue
-                assistant.handle(pcm)
+                if not assistant.handle(utterance.pcm, utterance.started_at):
+                    # 音を出していなければ、処理中に拾った音（呼びかけの続きなど）はそのまま聞き続ける
+                    continue
                 # 考え中・読み上げ中に拾った音 (自分の読み上げ音声を含む) は捨てる
                 buffer.clear()
                 while not frames.empty():
@@ -558,15 +685,27 @@ def run_wav(assistant: VoiceAssistant, segmenter: Segmenter, path: str) -> None:
         if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (SAMPLE_RATE, 1, 2):
             sys.exit("WAV は 16kHz / モノラル / 16bit にしてください（afconvert -f WAVE -d LEI16@16000 -c 1 で変換できます）")
         data = w.readframes(w.getnframes())
-    # 末尾に無音を足して、発話の終わりを確定させる
-    data += b"\0" * FRAME_BYTES * 40
+    # 末尾に、話し終わりの判定（--end-silence）より長い無音を足して、最後の発話の終わりを確定させる
+    data += b"\0" * FRAME_BYTES * (segmenter.end_ring.maxlen + 10)
     for i in range(0, len(data) - FRAME_BYTES + 1, FRAME_BYTES):
-        pcm = segmenter.push(data[i:i + FRAME_BYTES])
-        if pcm is not None:
-            assistant.handle(pcm)
+        utterance = segmenter.push(data[i:i + FRAME_BYTES])
+        if utterance is not None:
+            assistant.handle(utterance.pcm, utterance.started_at)
 
 
-def parse_args() -> argparse.Namespace:
+def bounded(low: float, high: float):
+    """argparse の type に渡す、範囲を検査する数値の変換関数を返す。"""
+
+    def parse(value: str) -> float:
+        number = float(value)
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"{low:g}〜{high:g} の範囲で指定してください（指定値: {value}）")
+        return number
+
+    return parse
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="マイクで話しかけると Claude が音声で答える")
     p.add_argument("--workdir", default=str(Path.cwd()), help="Claude Code を起動するディレクトリ（既定: 起動したディレクトリ）")
     p.add_argument("--model", help="Claude のモデル（既定: Claude Code の設定どおり）。速さ優先なら sonnet")
@@ -581,8 +720,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tools", help="組み込みツールを絞る（例: Read,Grep,Glob）。MCP のツールは対象外。既定は絞らない")
     p.add_argument("--safe-mode", action="store_true", help="CLAUDE.md・フック・MCP・Skill を読み込まない（軽く速い）")
     p.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL, help="文字起こしモデル（既定: %(default)s）")
-    p.add_argument("--wake", action="append", help="呼びかけ語。複数指定可（既定: クロード / クロド / くろーど / claude）")
-    p.add_argument("--followup", type=float, default=8.0, help="返答後、呼びかけなしで続けて話せる秒数。0 で無効（既定: %(default)s）")
+    p.add_argument(
+        "--wake",
+        action="append",
+        help="呼びかけ語。複数指定可（既定: クロード / claude）。読みで比べるので「クロド」「グロード」などの揺れも拾う",
+    )
+    p.add_argument(
+        "--followup",
+        type=bounded(0, 60),
+        default=8.0,
+        help="返答後、呼びかけなしで話し始められる秒数。0 で無効（既定: %(default)s）",
+    )
+    p.add_argument(
+        "--end-silence",
+        type=bounded(0.3, 5.0),
+        default=1.2,
+        help="この秒数黙ったら話し終わりとみなす（既定: %(default)s）。短くすると返事が早くなるが、"
+        "「クロード、」のあとの間で区切られやすくなる",
+    )
     p.add_argument("--voice", default="Kyoko", help="say の声（既定: %(default)s）")
     p.add_argument("--rate", type=int, help="読み上げ速度（1 分あたりの語数）")
     p.add_argument("--vad-level", type=int, default=2, choices=range(4), help="発話検出の厳しさ 0〜3（既定: %(default)s）")
@@ -594,7 +749,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wav", help="マイクの代わりに WAV ファイルを流す（動作確認用）")
     p.add_argument("--no-speak", action="store_true", help="読み上げずに画面表示だけにする")
     p.add_argument("--debug", action="store_true", help="呼びかけなしで無視した発話も表示する")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def main() -> None:
@@ -607,7 +762,7 @@ def main() -> None:
 
     device = int(args.device) if args.device and args.device.isdigit() else args.device
     assistant = VoiceAssistant(args)
-    segmenter = Segmenter(args.vad_level)
+    segmenter = Segmenter(args.vad_level, end_silence_ms=int(args.end_silence * 1000))
     try:
         assistant.warm_up()
         if args.wav:
@@ -615,12 +770,12 @@ def main() -> None:
         else:
             # ログをファイルやパイプに流すときは、状態表示の制御文字を混ぜない
             if sys.stdout.isatty():
-                status.start()
+                status_line.start()
             run_microphone(assistant, segmenter, device)
     except KeyboardInterrupt:
         log("終了します")
     finally:
-        status.stop()
+        status_line.stop()
         assistant.close()
 
 
