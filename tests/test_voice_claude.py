@@ -8,9 +8,11 @@ import voice_claude as vc
 
 
 @pytest.fixture
-def assistant(monkeypatch):
+def assistant(monkeypatch, tmp_path):
     # 文字起こしモデルや claude を起動せずに、判定と応答の流れだけを試す
     monkeypatch.setattr(vc, "Transcriber", lambda model: None)
+    # 実際のホームにある読み替えの一覧を読まない
+    monkeypatch.setattr(vc, "DEFAULT_READINGS_FILE", str(tmp_path / "readings.txt"))
     a = vc.VoiceAssistant(vc.parse_args([]))
     a.said, a.asked = [], []
     a.speaker.say = a.said.append
@@ -96,6 +98,74 @@ class TestToSpeech:
         speech = vc.to_speech("これは質問ですか？" * 60)
         assert speech.endswith("ですか？続きは画面に出しています。")
         assert len(speech) <= vc.MAX_SPEECH_CHARS + len("続きは画面に出しています。")
+
+
+class TestReadings:
+    speaker = vc.Speaker("Kyoko", None, False, vc.DEFAULT_READINGS)
+
+    @pytest.mark.parametrize(
+        ("text", "speech"),
+        [
+            ("月初に締めます", "げっしょに締めます"),
+            ("来月の月初に", "来月のげっしょに"),
+            ("月初処理", "げっしょ処理"),
+            ("期初の目標", "きしょの目標"),
+        ],
+    )
+    def test_replaces_misread_words(self, text, speech):
+        assert self.speaker.pronounce(text) == speech
+
+    @pytest.mark.parametrize(
+        "text",
+        ["11月初旬に", "4月初日", "9月初頭", "月初めに", "今月初めに", "お正月初詣", "学期初めに", "学期初日", "今期初の黒字"],
+    )
+    def test_keeps_default_words_inside_other_words(self, text):
+        # 既定の語が別の語の一部になっているときは、置き換えて読みを壊さない
+        assert self.speaker.pronounce(text) == text
+
+    def test_prefers_longer_word_at_same_position(self):
+        speaker = vc.Speaker("Kyoko", None, False, {"月初": "げっしょ", "月初旬": "がつしょじゅん"})
+        assert speaker.pronounce("11月初旬と月初") == "11がつしょじゅんとげっしょ"
+
+    @pytest.mark.parametrize(("text", "speech"), [("PR を出す", "ぴーあーる を出す"), ("PRODUCTION環境", "PRODUCTION環境")])
+    def test_replaces_latin_words_only_as_whole_words(self, text, speech):
+        assert vc.Speaker("Kyoko", None, False, {"PR": "ぴーあーる"}).pronounce(text) == speech
+
+    def test_ignores_empty_word(self):
+        assert vc.Speaker("Kyoko", None, False, {"": "x"}).pronounce("月初") == "月初"
+
+    def test_say_speaks_pronounced_text(self, monkeypatch):
+        inputs = []
+        monkeypatch.setattr(vc.subprocess, "run", lambda cmd, **kw: inputs.append(kw["input"]))
+        vc.Speaker("Kyoko", None, True, vc.DEFAULT_READINGS).say("月初です")
+        assert inputs == ["げっしょです"]
+
+    def test_loads_file_on_top_of_defaults(self, tmp_path):
+        path = tmp_path / "readings.txt"
+        path.write_text(
+            "\ufeff# 社内の言葉（BOM 付きで保存）\n\n工数 こうすう  # 見積もりの単位\n＃ 全角の＃もコメント\n月初 つきはじめ\n",
+            encoding="utf-8",
+        )
+        assert vc.load_readings(str(path)) == {"月初": "つきはじめ", "期初": "きしょ", "工数": "こうすう"}
+
+    def test_uses_defaults_when_default_file_is_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vc, "DEFAULT_READINGS_FILE", str(tmp_path / "missing.txt"))
+        assert vc.load_readings(None) == vc.DEFAULT_READINGS
+
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            (None, "見つかりません"),  # 指定したファイルが無い（打ち間違い）
+            ("工数 こうすう".encode("shift_jis"), "UTF-8 で保存してください"),
+            ("月初\n".encode(), "readings.txt:1"),
+        ],
+    )
+    def test_rejects_unreadable_file(self, tmp_path, content, message):
+        path = tmp_path / "readings.txt"
+        if content is not None:
+            path.write_bytes(content)
+        with pytest.raises(SystemExit, match=message):
+            vc.load_readings(str(path))
 
 
 class TestStatusLine:

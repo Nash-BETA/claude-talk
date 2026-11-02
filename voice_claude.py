@@ -67,6 +67,15 @@ SYSTEM_PROMPT = """\
 # NOTE: 長い返答を最後まで読み上げると会話にならないので、冒頭だけ読んで続きは画面に任せる
 MAX_SPEECH_CHARS = 300
 
+# NOTE: Kyoko（compact）は「初」を「はつ」と読む癖がある。月初 → つきはつ は耳で確認、
+#       期初 → きはつ は読み上げを Whisper で書き起こすと「揮発」になったことからの推定。
+#       読み間違える語は、読み上げる直前にひらがなへ置き換える。--readings のファイルで追加できる
+DEFAULT_READINGS = {"月初": "げっしょ", "期初": "きしょ"}
+DEFAULT_READINGS_FILE = "~/.config/claude-talk/readings.txt"
+# NOTE: 既定の語は「11月初旬」「今月初め」「学期初め」「今期初の」のような別の語の一部では置き換えない。
+#       前が漢字か数字のとき、後ろが「め」「旬」などのときは、迷ったら置き換えずに Kyoko の読みのままにする
+DEFAULT_READING_GUARD = (r"(?<![0-9０-９一-鿿々〆])", r"(?![め旬日頭詣])")
+
 # NOTE: UserPromptSubmit フックにブロックされると、ブロック文が is_error: false の返答として返ってくる。
 #       文面はこの接頭辞で始まる（Claude Code 2.1.314 で実測）
 HOOK_BLOCKED_PREFIX = "UserPromptSubmit operation blocked by hook"
@@ -601,11 +610,68 @@ class ClaudeSession:
         self.proc = None
 
 
+def load_readings(path: str | None) -> dict[str, str]:
+    """読み替えの一覧を読む。1 行に「語 読み」を空白で区切って書く。# から後ろはコメント。
+
+    path を指定しなければ既定のファイルを読み、無ければ既定の読み替えだけを使う。
+    指定したファイルが無いときは、打ち間違いに気づけるよう止める。
+    """
+    readings = dict(DEFAULT_READINGS)
+    if path is None:
+        path = DEFAULT_READINGS_FILE
+        if not Path(path).expanduser().exists():
+            return readings
+    file = Path(path).expanduser()
+    try:
+        # BOM 付きで保存されていても 1 行目の語が化けないよう、utf-8-sig で読む
+        content = file.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        sys.exit(f"{file}: 読み替えの一覧が見つかりません")
+    except UnicodeDecodeError:
+        sys.exit(f"{file}: 読み替えの一覧は UTF-8 で保存してください")
+    except OSError as e:
+        sys.exit(f"{file}: 読み替えの一覧を読めませんでした: {e}")
+    for number, line in enumerate(content.splitlines(), 1):
+        line = re.split(r"[#＃]", line, maxsplit=1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            sys.exit(f"{file}:{number}: 「語 読み」の形で書いてください（書かれていた内容: {line}）")
+        readings[parts[0]] = parts[1]
+    return readings
+
+
+def reading_pattern(word: str) -> str:
+    """読み替える語の正規表現。別の語の一部に当たって読みを壊さないよう、前後の条件を付ける。"""
+    pattern = re.escape(word)
+    if word in DEFAULT_READINGS:
+        before, after = DEFAULT_READING_GUARD
+        pattern = before + pattern + after
+    # 英字の語（PR など）は、英単語の途中（PRODUCTION の PR など）では置き換えない
+    if word[0].isascii() and word[0].isalnum():
+        pattern = r"(?<![A-Za-z0-9])" + pattern
+    if word[-1].isascii() and word[-1].isalnum():
+        pattern += r"(?![A-Za-z0-9])"
+    return pattern
+
+
 class Speaker:
-    def __init__(self, voice: str, rate: int | None, enabled: bool):
+    def __init__(self, voice: str, rate: int | None, enabled: bool, readings: dict[str, str]):
         self.voice = voice
         self.rate = rate
         self.enabled = enabled
+        self.readings = readings
+        # NOTE: 置き換えは文の頭から順に行う。同じ位置から始まる語は長い方を先に試す
+        #       （「月初旬」を登録すれば、「11月初旬」の中では「月初」より優先される）
+        words = sorted((w for w in readings if w), key=len, reverse=True)
+        self.reading_pattern = re.compile("|".join(map(reading_pattern, words))) if words else None
+
+    def pronounce(self, text: str) -> str:
+        """読み間違える語を、読みのひらがなに置き換える。"""
+        if self.reading_pattern is None:
+            return text
+        return self.reading_pattern.sub(lambda m: self.readings[m.group()], text)
 
     def say(self, text: str) -> None:
         if not self.enabled or not text:
@@ -614,7 +680,7 @@ class Speaker:
         if self.rate:
             cmd += ["-r", str(self.rate)]
         # 本文は標準入力で渡す (先頭が "-" の文がオプションとして解釈されないように)
-        subprocess.run(cmd, input=text, text=True, check=False)
+        subprocess.run(cmd, input=self.pronounce(text), text=True, check=False)
 
     def cue(self) -> None:
         if self.enabled and CUE_SOUND.exists():
@@ -623,6 +689,8 @@ class Speaker:
 
 class VoiceAssistant:
     def __init__(self, args: argparse.Namespace):
+        # 設定ファイルの誤りは、文字起こしモデルを読み込む前に知らせる
+        self.speaker = Speaker(args.voice, args.rate, not args.no_speak, load_readings(args.readings))
         self.transcribe = Transcriber(args.whisper_model)
         self.wake = WakeMatcher(args.wake or DEFAULT_WAKE_WORDS)
         self.claude = ClaudeSession(
@@ -633,7 +701,6 @@ class VoiceAssistant:
             safe_mode=args.safe_mode,
             timeout=args.timeout,
         )
-        self.speaker = Speaker(args.voice, args.rate, not args.no_speak)
         self.followup_sec = args.followup
         self.debug = args.debug
         # 呼びかけなしで受け付ける発話の、話し始めの時刻の範囲
@@ -827,6 +894,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--voice", default="Kyoko", help="say の声（既定: %(default)s）")
     p.add_argument("--rate", type=int, help="読み上げ速度（1 分あたりの語数）")
+    p.add_argument(
+        "--readings",
+        help=f"読み替えの一覧のファイル。1 行に「語 読み」を書く（既定: {DEFAULT_READINGS_FILE}。無ければ使わない）",
+    )
     p.add_argument("--vad-level", type=int, default=2, choices=range(4), help="発話検出の厳しさ 0〜3（既定: %(default)s）")
     p.add_argument(
         "--timeout", type=float, default=600.0, help="最後の出力からこの秒数、何も返ってこなければ打ち切る（既定: %(default)s）"
