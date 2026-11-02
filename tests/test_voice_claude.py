@@ -1,4 +1,4 @@
-"""voice_claude の、マイク・Claude・音声合成に依存しない部分のテスト。"""
+"""voice_claude の、マイク・Claude・音声合成・メニューバーの実物に依存しない部分のテスト。"""
 import os
 import time
 
@@ -114,6 +114,126 @@ class TestStatusLine:
         monkeypatch.setattr(vc.shutil, "get_terminal_size", lambda fallback: os.terminal_size((20, 24)))
         fitted = vc.StatusLine._fit("🎙  続けてどうぞ（あと 6 秒）  ████")
         assert sum(vc.display_width(c) for c in fitted) <= 19
+
+    @pytest.mark.parametrize(
+        ("level", "followup", "text"),
+        [
+            (0.0, 0.0, "🎙 待機中 ▁"),
+            (1.0, 0.4, "🎙 続けてどうぞ 1秒 █"),
+        ],
+    )
+    def test_menu_text_format(self, level, followup, text):
+        status = vc.StatusLine()
+        status.level = level
+        if followup:
+            status.open_followup(time.monotonic() + followup)
+        assert status.menu_text() == text
+
+    @pytest.mark.parametrize("state", list(vc.State))
+    def test_both_displays_handle_every_state(self, state):
+        # 状態を足したときに、片方の表示だけ直し忘れていないか
+        status = vc.StatusLine()
+        status.set_state(state)
+        assert status.text() and status.menu_text()
+
+    def test_menu_text_rejects_unknown_state(self):
+        status = vc.StatusLine()
+        status.state_since = ("listning", time.monotonic())
+        with pytest.raises(ValueError):
+            status.menu_text()
+
+
+class FakeStdin:
+    """補助プロセスの標準入力の代わり。broken にすると、終了したプロセスへの書き込みと同じく失敗する。"""
+
+    def __init__(self):
+        self.lines, self.broken, self.closed = [], False, False
+
+    def write(self, text):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if self.broken:
+            raise BrokenPipeError
+        self.lines.append(text)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+        if self.broken:
+            raise BrokenPipeError
+
+
+class FakeProc:
+    """補助プロセスの代わり。hang にすると、標準入力を閉じても終了しないプロセスになる。"""
+
+    def __init__(self):
+        self.stdin, self.hang, self.killed = FakeStdin(), False, False
+
+    def wait(self, timeout=None):
+        if self.hang and not self.killed:
+            raise vc.subprocess.TimeoutExpired("menubar.py", timeout)
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.fixture
+def menubar(monkeypatch):
+    # 本物のメニューバーの項目を出さないよう、補助プロセスを起動しない
+    monkeypatch.setattr(vc.subprocess, "Popen", lambda *a, **kw: FakeProc())
+    return vc.MenuBar()
+
+
+class TestMenuBar:
+    def test_sends_only_changes(self, menubar):
+        for text in ["🎙 待機中 ▁", "🎙 待機中 ▁", "👂 聞き取り中 ▅"]:
+            assert menubar.show(text) is True
+        assert menubar.proc.stdin.lines == ["🎙 待機中 ▁\n", "👂 聞き取り中 ▅\n"]
+
+    def test_reports_exited_helper(self, menubar):
+        menubar.proc.stdin.broken = True
+        assert menubar.show("🎙 待機中 ▁") is False
+
+    def test_reports_send_after_close(self, menubar):
+        menubar.close()
+        assert menubar.show("🎙 待機中 ▁") is False
+
+    def test_close_tolerates_exited_helper(self, menubar):
+        menubar.proc.stdin.broken = True
+        menubar.close()
+        assert menubar.proc.killed is False
+
+    def test_close_kills_helper_that_does_not_exit(self, menubar):
+        menubar.proc.hang = True
+        menubar.close()
+        assert menubar.proc.killed is True
+
+
+class TestDraw:
+    def test_stops_sending_when_helper_exited(self, menubar, capsys):
+        status = vc.StatusLine()
+        status.menubar = menubar
+        menubar.proc.stdin.broken = True
+        status.draw()
+        assert status.menubar is None and not status.visible
+        assert "状態を表示できなくなりました" in capsys.readouterr().out
+
+    def test_keeps_quiet_when_stopped_while_sending(self, menubar, capsys):
+        status = vc.StatusLine()
+        status.menubar = menubar
+
+        # 送っている最中に終了処理が始まり、補助プロセスが閉じられた場合
+        def write_during_shutdown(text):
+            status.stop()
+            menubar.close()
+            raise ValueError("I/O operation on closed file")
+
+        menubar.proc.stdin.write = write_during_shutdown
+        status.draw()
+        assert capsys.readouterr().out == ""
 
 
 class TestSegmenter:

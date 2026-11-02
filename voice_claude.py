@@ -92,32 +92,88 @@ class State(StrEnum):
     SPEAKING = "speaking"
 
 
+class MenuBar:
+    """メニューバーに状態を出す補助プロセス (menubar.py) を動かす。ほかのアプリを見ていても状態が分かる。
+
+    NOTE: メニューバーの項目は、メインスレッドで AppKit のイベントループを回さないと出せない。
+          メインスレッドはマイクの処理で埋まっているので、別プロセスにして表示する文字列だけを送る。
+    """
+
+    SCRIPT = Path(__file__).with_name("menubar.py")
+
+    def __init__(self) -> None:
+        self.last = ""
+        self.proc = subprocess.Popen(
+            [sys.executable, str(self.SCRIPT)],
+            stdin=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            # ターミナルの Ctrl+C を補助プロセスに届けない。終了は本体が標準入力を閉じて伝える
+            start_new_session=True,
+        )
+
+    def show(self, text: str) -> bool:
+        """表示を差し替える。補助プロセスが終了していて送れなければ False を返す。"""
+        if text == self.last:
+            return True
+        try:
+            self.proc.stdin.write(text + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):  # ValueError は close() のあとに書いたとき
+            return False
+        self.last = text
+        return True
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+
 class StatusLine:
-    """ターミナルの最下行に今の状態を出し続ける。ログはその上に流す。
+    """今の状態を、ターミナルの最下行とメニューバーに出し続ける。ターミナルのログは最下行の上に流す。
 
     マイクの音量に合わせてバーが伸び縮みするので、声を拾えているかが話しながら分かる。
-    定期的な描画は _tick スレッドだけが行う。音声を処理するメインループは端末への書き込みを待たない。
+    定期的な描画は _tick スレッドだけが行う。音声を処理するメインループは表示の書き込みを待たない。
     """
 
     SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     BAR_WIDTH = 12
+    # メニューバーは幅が限られる（混んでいるとノッチの裏に隠れる）ので、音量はバーではなく 1 文字で示す
+    METER = "▁▂▃▄▅▆▇█"
     # この範囲の入力レベル (dBFS) を、バーの空〜満タンに対応させる。
     # 下限は室内の雑音（実測 -45〜-56 dBFS）でほとんど伸びない値にしている
     LEVEL_FLOOR_DB = -50.0
     LEVEL_CEIL_DB = -15.0
 
     def __init__(self) -> None:
-        self.enabled = False
+        self.enabled = False  # ターミナルの最下行に描くか
+        self.menubar: MenuBar | None = None
         self.lock = threading.Lock()
         self.state_since: tuple[State, float] = (State.IDLE, time.monotonic())
         self.level = 0.0
         self.followup_until = 0.0
 
-    def start(self) -> None:
-        self.enabled = True
-        threading.Thread(target=self._tick, daemon=True).start()
+    @property
+    def visible(self) -> bool:
+        return self.enabled or self.menubar is not None
+
+    def start(self, terminal: bool, menubar: MenuBar | None = None) -> None:
+        self.enabled = terminal
+        self.menubar = menubar
+        if self.visible:
+            threading.Thread(target=self._tick, daemon=True).start()
 
     def stop(self) -> None:
+        # 補助プロセスを閉じるのは起動した側 (main) の役目。ここでは送るのをやめるだけ
+        self.menubar = None
         with self.lock:
             if self.enabled:
                 self.enabled = False
@@ -159,6 +215,27 @@ class StatusLine:
                 return f"🎙  {label}  {bar}"
         raise ValueError(f"未知の状態: {state!r}")
 
+    def menu_text(self) -> str:
+        """メニューバー向けの短い表示。"""
+        now = time.monotonic()
+        state, since = self.state_since
+        spinner = self.SPINNER[int(now * 10) % len(self.SPINNER)]
+        meter = self.METER[round(self.level * (len(self.METER) - 1))]
+        match state:
+            case State.LISTENING:
+                return f"👂 聞き取り中 {meter}"
+            case State.TRANSCRIBING:
+                return f"{spinner} 文字起こし中"
+            case State.THINKING:
+                return f"{spinner} 考え中 {now - since:.0f}秒"
+            case State.SPEAKING:
+                return "🔊 読み上げ中"
+            case State.IDLE:
+                rest = self.followup_until - now
+                label = f"続けてどうぞ {math.ceil(rest)}秒" if rest > 0 else "待機中"
+                return f"🎙 {label} {meter}"
+        raise ValueError(f"未知の状態: {state!r}")
+
     def render(self) -> None:
         with self.lock:
             if not self.enabled:
@@ -178,9 +255,19 @@ class StatusLine:
         return text
 
     def _tick(self) -> None:
-        while self.enabled:
+        while self.visible:
             time.sleep(0.1)
-            self.render()
+            self.draw()
+
+    def draw(self) -> None:
+        self.render()
+        menubar = self.menubar
+        if menubar is None or menubar.show(self.menu_text()):
+            return
+        # stop() のあとに送って失敗した場合は、終了処理中なので知らせない
+        if self.menubar is menubar:
+            self.menubar = None
+            log("メニューバー", "状態を表示できなくなりました")
 
 
 status_line = StatusLine()
@@ -604,9 +691,9 @@ class VoiceAssistant:
         if command == "":
             # NOTE: 呼びかけ語だけのときは返事をしない。「クロード、」のあとの間で発話が区切られても、
             #       続きを話している最中に声を重ねず、その間に拾った音も捨てずに聞き続けるため。
-            #       受け付けていることは最下行の「続けてどうぞ」で示す
+            #       受け付けていることは状態表示（最下行とメニューバー）の「続けてどうぞ」で示す
             self._open_followup(since=heard_at, seconds=CALL_ONLY_WINDOW_SEC)
-            if not status_line.enabled:
+            if not status_line.visible:
                 log("受付中", f"{CALL_ONLY_WINDOW_SEC:.0f} 秒以内に続けて話してください")
             return False
         if any(p in command for p in RESET_PHRASES):
@@ -748,6 +835,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--list-devices", action="store_true", help="オーディオデバイスの一覧を表示して終了")
     p.add_argument("--wav", help="マイクの代わりに WAV ファイルを流す（動作確認用）")
     p.add_argument("--no-speak", action="store_true", help="読み上げずに画面表示だけにする")
+    p.add_argument("--no-menubar", action="store_true", help="メニューバーに状態を出さない")
     p.add_argument("--debug", action="store_true", help="呼びかけなしで無視した発話も表示する")
     return p.parse_args(argv)
 
@@ -763,20 +851,26 @@ def main() -> None:
     device = int(args.device) if args.device and args.device.isdigit() else args.device
     assistant = VoiceAssistant(args)
     segmenter = Segmenter(args.vad_level, end_silence_ms=int(args.end_silence * 1000))
+    # モデルの読み込み中から「準備中」と出しておくため、状態表示より先に起動する
+    menubar = None if args.wav or args.no_menubar else MenuBar()
     try:
         assistant.warm_up()
         if args.wav:
             run_wav(assistant, segmenter, args.wav)
         else:
-            # ログをファイルやパイプに流すときは、状態表示の制御文字を混ぜない
-            if sys.stdout.isatty():
-                status_line.start()
+            # ログをファイルやパイプに流すときは、最下行の状態表示の制御文字を混ぜない
+            status_line.start(terminal=sys.stdout.isatty(), menubar=menubar)
             run_microphone(assistant, segmenter, device)
     except KeyboardInterrupt:
         log("終了します")
     finally:
-        status_line.stop()
-        assistant.close()
+        # 表示の後始末の途中で Ctrl+C を重ねて押されても、claude（とツールが起動した子プロセス）は必ず止める
+        try:
+            status_line.stop()
+            if menubar is not None:
+                menubar.close()
+        finally:
+            assistant.close()
 
 
 if __name__ == "__main__":
